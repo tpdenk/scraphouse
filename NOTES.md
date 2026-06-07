@@ -122,7 +122,14 @@ The string table architecture decouples physical chronological storage from logi
 * **The Alphabetical Index (`strtab_N.idx`):** A supplementary on-disk B-Tree maps `String -> Fat Pointer`. When loaded into memory, this index retains the string keys alongside physical offsets. This permits binary searches in RAM without triggering decompressions of the `.blob` blocks.
 * **Arbitrary Wildcards (`%r%`):** Leading wildcards invalidate the alphabetical index. Users must explicitly define a secondary Trigram/N-gram index on specific columns to support fast arbitrary substring matching.
 
-### 7.1 Intra-Block Resolution & Length Calculation
+### 7.1 Block Compression & Alignment
+Because compressed sizes are unpredictable, strings are accumulated in an uncompressed thread-local buffer until a conservative threshold is reached (e.g., 8KiB to 10KiB).
+
+**Speculative De-escalation:** The engine attempts to compress this buffer. If the resulting output exceeds 4096 bytes, the last string is popped off, deferred to the next block's queue, and the buffer is re-compressed.
+
+**Zero-Padding:** If the compressed output is smaller than 4096 bytes (e.g., 3800 bytes), the remainder is padded with zeros. This sacrifices a negligible amount of disk space to guarantee perfect `O_DIRECT` hardware alignment and strict $O(1)$ Fat Pointer math.
+
+### 7.2 Intra-Block Resolution & Length Calculation
 Decompressed 4KiB blocks function as slotted pages. A directory at the end of the block contains an array of `u16` byte offsets mapping the `Intra-Block Index` directly to physical start positions within the buffer.
 
 To guarantee branchless $O(1)$ length calculation, a block containing $N$ strings strictly stores $N + 1$ offsets. This final $N+1$ offset is a synthetic boundary marker that contains no data. It points to the exact end of the data segment (the start of the free space), ensuring the `offset[i+1] - offset[i]` math works universally without requiring an `if (is_last_string)` branch instruction on the CPU hot path.
