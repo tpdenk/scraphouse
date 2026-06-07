@@ -1,4 +1,4 @@
-# Architecture
+# Glommio-Optimized Database Architecture
 
 ## 1. Core Architecture (Glommio Runtime)
 * **Design Paradigm:** Column-based, structured database accessed via a custom driver (no JDBC). 
@@ -49,7 +49,7 @@ The directory structure logically separates data. Files are accessed exclusively
 ```
 
 ### 2.2 Data Ownership & Hashing
-$$core\\_id_{owner} \equiv hash(db\\_id, table\\_id, col\\_id, block\\_id) \pmod{num\\_cores}$$
+$$core\_id_{owner} \equiv hash(db\_id, table\_id, col\_id, block\_id) \pmod{num\_cores}$$
 
 Hashing each column independently distributes a single row's columns across the mesh. This prevents the single core owning an active block from bottlenecking table writes.
 
@@ -97,12 +97,20 @@ sequenceDiagram
 ---
 
 ## 6. Read Pipeline & Routing
-Routing relies on thread-local state.
+Routing queries efficiently relies on thread-local metadata to minimize cross-core communication and disk I/O.
 
-1. **Local Pruning:** The coordinator checks its thread-local Zone Map for overlapping `block_id`s, unconditionally including unsealed active blocks.
-2. **Mesh RPC:** Batched read requests traverse the mesh to target workers.
-3. **Zero-Copy Fetch:** Workers fetch blocks via `DmaFile`, apply SIMD masks for `tombstones` and `transaction_committed`, and return dense buffers to the coordinator.
-4. **Tuple Alignment:** The coordinator aligns scattered column fragments by `rowid` and streams tuples to the TCP socket.
+### 6.1 Zone Maps & Local Pruning
+**What they are:** Zone maps are lightweight, block-level min/max indexes that allow the database to mathematically prove a block does not contain relevant data, enabling it to skip processing that block entirely.
+
+**Storage on Disk:** When a worker core finishes writing and seals a 256KiB `block_<n>.dat`, it computes the minimum and maximum values for that specific chunk. It persists these bounds permanently in the block's adjacent `meta_<n>.json` file.
+
+**In-Memory Routing:** On startup, the coordinator loads the contents of all `meta_<n>.json` files into a thread-local, in-memory map. When a query arrives (e.g., `WHERE age > 50`), the coordinator evaluates the predicate against this RAM-based map. If a block's `max` age is `45`, the coordinator instantly prunes that block from the execution plan, completely avoiding the mesh RPC and disk read. Active (unsealed) blocks are unconditionally included.
+
+### 6.2 Mesh RPC & Zero-Copy Fetch
+For blocks that survive pruning, batched read requests traverse the mesh to the target worker cores. Workers fetch the blocks via `DmaFile`, apply SIMD masks for `tombstones` and `transaction_committed`, and return dense buffers back across the mesh.
+
+### 6.3 Tuple Alignment
+The coordinator receives the scattered, filtered column fragments. It aligns them by `rowid` and streams the reconstructed tuples directly to the TCP socket.
 
 ---
 
@@ -121,13 +129,13 @@ To guarantee branchless $O(1)$ length calculation, a block containing $N$ string
 
 ```mermaid
 flowchart TD
-    Req[Query: WHERE name = 'Arne'] --> Idx[Search Alphabetical B-Tree Index]
-    Idx -- Binary Search (RAM) --> FP[Extract FP: Chunk 0, Block 5, Idx 2]
-    FP --> Dma[io_uring Read: strtab_0.blob, Block 5]
-    Dma --> Decomp[Decompress 4KiB Block]
-    Decomp --> CalcLen[Calculate Length: offset[3] - offset[2]]
-    CalcLen --> Extract[Read N bytes at offset[2]]
-    Extract --> Worker[SIMD Scan using integer FP]
+    Req["Query: WHERE name = 'Arne'"] --> Idx["Search Alphabetical B-Tree Index"]
+    Idx -- "Binary Search (RAM)" --> FP["Extract FP: Chunk 0, Block 5, Idx 2"]
+    FP --> Dma["io_uring Read: strtab_0.blob, Block 5"]
+    Dma --> Decomp["Decompress 4KiB Block"]
+    Decomp --> CalcLen["Calculate Length: offset[3] - offset[2]"]
+    CalcLen --> Extract["Read N bytes at offset[2]"]
+    Extract --> Worker["SIMD Scan using integer FP"]
 ```
 
 ---
