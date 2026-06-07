@@ -118,7 +118,16 @@ The coordinator receives the scattered, filtered column fragments. It aligns the
 The string table architecture decouples physical chronological storage from logical alphabetical sorting, enabling both block-level compression and $O(\log n)$ lookups.
 
 * **Physical Storage (`strtab_N.blob`):** Strings are append-only. They are buffered into 4KiB blocks, compressed as an entire block (e.g., using Zstd or LZ4), and appended chronologically. 
-* **The Fat Pointer:** The 64-bit integer stored in the 256KiB column blocks is a direct physical coordinate: `[Chunk ID (16 bits) | 4KiB Block ID (24 bits) | Intra-Block Index (24 bits)]`. This guarantees $O(1)$ physical resolution for reading data back.
+* **The Fat Pointer:** The 64-bit integer stored in the 256KiB column blocks is a direct physical coordinate. This guarantees $O(1)$ physical resolution for reading data back.
+
+```mermaid
+packet-beta
+title 64-Bit Fat Pointer Structure
+0-15: "Chunk ID (16 bits)"
+16-39: "Block ID (24 bits)"
+40-63: "Intra-Block Index (24 bits)"
+```
+
 * **The Alphabetical Index (`strtab_N.idx`):** A supplementary on-disk B-Tree maps `String -> Fat Pointer`. When loaded into memory, this index retains the string keys alongside physical offsets. This permits binary searches in RAM without triggering decompressions of the `.blob` blocks.
 * **Arbitrary Wildcards (`%r%`):** Leading wildcards invalidate the alphabetical index. Users must explicitly define a secondary Trigram/N-gram index on specific columns to support fast arbitrary substring matching.
 
@@ -131,6 +140,17 @@ Because compressed sizes are unpredictable, strings are accumulated in an uncomp
 
 ### 7.2 Intra-Block Resolution & Length Calculation
 Decompressed 4KiB blocks function as slotted pages. A directory at the end of the block contains an array of `u16` byte offsets mapping the `Intra-Block Index` directly to physical start positions within the buffer.
+
+```mermaid
+packet-beta
+title 4KiB Slotted Page Directory (Trailer grows inwards)
+0-15: "... Free Space ..."
+16-31: "Offset N+1 (u16) [Boundary]"
+32-47: "Offset N (u16)"
+48-63: "..."
+64-79: "Offset 1 (u16)"
+80-95: "Offset 0 (u16)"
+```
 
 To guarantee branchless $O(1)$ length calculation, a block containing $N$ strings strictly stores $N + 1$ offsets. This final $N+1$ offset is a synthetic boundary marker that contains no data. It points to the exact end of the data segment (the start of the free space), ensuring the `offset[i+1] - offset[i]` math works universally without requiring an `if (is_last_string)` branch instruction on the CPU hot path.
 
