@@ -49,7 +49,7 @@ The directory structure logically separates data. Files are accessed exclusively
 ```
 
 ### 2.2 Data Ownership & Hashing
-$$core\_id_{owner} \equiv hash(db\_id, table\_id, col\_id, block\_id) \pmod{num\_cores}$$
+$$core\\_id_{owner} \equiv hash(db\\_id, table\\_id, col\\_id, block\\_id) \pmod{num\\_cores}$$
 
 Hashing each column independently distributes a single row's columns across the mesh. This prevents the single core owning an active block from bottlenecking table writes.
 
