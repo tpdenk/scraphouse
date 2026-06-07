@@ -1,168 +1,144 @@
-# Assumptions
-* column-based, structured database
-* thread-per-core architecture
-* custom driver, no jdbc
+# Architecture
 
-# Storage format
+## 1. Core Architecture (Glommio Runtime)
+* **Design Paradigm:** Column-based, structured database accessed via a custom driver (no JDBC). 
+* **Execution Model:** `glommio::LocalExecutor` bounds tasks to a single pinned CPU core. Data structures implement `!Send` and `!Sync`. Thread safety is enforced at compile time without atomic instructions.
+* **Network Binding:** `glommio::net::TcpListener` uses `SO_REUSEPORT`. The Linux kernel distributes incoming TCP connections across pinned threads, bypassing user-space dispatchers.
+* **Storage I/O:** Storage access strictly uses `glommio::io::DmaFile` (Direct I/O via `io_uring`). Bypassing the OS page cache allows the thread executor to process other tasks concurrently with disk operations.
+* **Memory Alignment:** `DmaFile` requires strict hardware alignment. All in-memory 256KiB blocks are allocated with 4KiB page alignment. Compression is strictly disk-only; data is always uncompressed in memory to allow instant freeing without re-allocation penalties.
+
+---
+
+## 2. Storage Format & Topology
+The directory structure logically separates data. Files are accessed exclusively by their mathematically assigned core. 
+
+* **Logical Naming:** Column and table names are stored exclusively in `meta.json` files, not in the directory structure. Queries are compiled to use internal integer IDs, allowing zero-cost `$RENAME` operations without touching the filesystem or invalidating cached queries.
+* **Sparse Blocks:** If a 256KiB block consists entirely of a single repeated value (common in boolean or tombstone columns), the physical `block_<n>.dat` file is omitted. The `meta_<n>.json` simply records a `sparse_value`, saving disk space and I/O.
+
+### 2.1 Concrete Schema Layout Example: `users` Table
 ```text
-.../database
-└── <db_name>
-    ├── meta.json
-    └── table_<n>
-        ├── meta.json
-        └── col_<n>
-            ├── meta.json
-            ├── wal.log
-            ├── strtab.dat
-            │   ├── hashmaps in memory
-            │   ├── compressed on disk
-            │   ├── probably have to chunk this into several files/blocks
-            │   │   ├── use bloom filters to easily check whether a string is contained in a block
-            |   │   └── false negatives are not an issue, we probably still end up >99% deduplication
-            └── blocks
-                ├── block_<n>.dat
-                │   ├── _raw, compact data depending on the col type_
-                │   ├── always sorted by RID
-                │   └── max 256KiB (tunable)
-                └── meta_<n>.json
-                    ├── first and last RID
-                    ├── mix/max value of this block
-                    └── some metadata that helps with indexing?
-
-```
-<details>
-  <summary>Example <code>users</code></summary>
-  <pre>
 .../database
 └── users
     ├── meta.json
+    ├── wal_0.log
+    ├── wal_1.log
     └── table_0
         ├── meta.json
-        ├── col_0
-        │   ├── meta.json
-        │   │   ├── name: tombstones
-        │   │   ├── type: bool
-        │   │   └── compression: none
-        │   ├── wal.log
-        │   ├── ~strtab.dat~ does not exist for bool cols
+        ├── col_0 (tombstones)
+        │   ├── meta.json (type: bool, compression: none)
         │   └── blocks
-        │       ├── block_0.dat
-        │       │   ├── up to 256KiB of 1-byte aligned bools
-        │       │   └── sorted by RID
-        │       └── meta_0.json
-        │           ├── first RID: 0
-        │           ├── last RID: 4
-        │           └── min/max: 0/1 (false/true, doesn't make sense for bool)
-        ├── col_1
-        │   ├── meta.json
-        │   │   ├── name: transaction
-        │   │   ├── type: uint64
-        │   │   └── compression: none
-        │   ├── wal.log
-        │   ├── ~strtab.dat~ does not exist for uint64 cols
+        │       ├── block_0.dat (up to 256KiB of 1-byte aligned bools)
+        │       └── meta_0.json (first/last RID: 0/4)
+        ├── col_1 (transaction)
+        │   ├── meta.json (type: uint64, compression: none)
         │   └── blocks
-        │       ├── block_0.dat
-        │       │   ├── up to 32768 (256KiB of 8-byte aligned) uint64
-        │       │   └── sorted by RID
-        │       └── meta_0.json
-        │           ├── first RID: 0
-        │           ├── last RID: 4 (up to 65536)
-        │           └── min/max: 0/0
-        ├── col_2
-        │   ├── meta.json
-        │   │   ├── name: age
-        │   │   ├── type: uint32
-        │   │   └── compression: none
-        │   ├── wal.log
-        │   ├── ~strtab.dat~ does not exist for uint32 cols
+        │       ├── block_0.dat (up to 32768 8-byte aligned uint64s)
+        │       └── meta_0.json (first/last RID: 0/4)
+        ├── col_2 (age)
+        │   ├── meta.json (type: uint32, compression: none)
         │   └── blocks
-        │       ├── block_0.dat
-        │       │   ├── up to 65536 (256KiB of 4-byte aligned) uint32
-        │       │   └── sorted by RID
-        │       └── meta_0.json
-        │           ├── first RID: 0
-        │           ├── last RID: 4 (up to 65536)
-        │           ├── min: 21
-        │           └── max: 55
-        └── col_3
-            ├── meta.json
-            │   ├── name: name
-            │   ├── type: string
-            │   └── compression: lz4
-            ├── wal.log
-            ├── strtab.dat
-            │   ├── `[0]`: Arne
-            │   ├── `[1]`: Betty
-            │   └── `[2]`: Charly
+        │       ├── block_0.dat (up to 65536 4-byte aligned uint32s)
+        │       └── meta_0.json (first/last RID: 0/4, min: 21, max: 55)
+        └── col_3 (name)
+            ├── meta.json (type: string, compression: lz4)
+            ├── strtab_0.blob (Zstd-compressed 4KiB blocks of raw string bytes)
+            ├── strtab_0.idx (Alphabetical B-Tree: "Arne" -> [0 | 5 | 2])
             └── blocks
-                ├── block_0.dat
-                │   ├── up to 65536 (256KiB of 4-byte aligned) uint32
-                │   ├── indices into strtab
-                │   └── sorted by RID
-                └── meta_0.json
-                    ├── first RID: 0
-                    ├── last RID: 4 (up to 65536)
-                    └── min/max: 0/2 (some indices into strtab as well)
-  </pre>
-</details>
+                ├── block_0.dat (64-bit Fat Pointers mapping to strtab_0.blob)
+                └── meta_0.json (first/last RID: 0/4)
+```
 
-## Accessing data
-Every file in the structure has exactly one core, that own that file.
-That owner relationship is defined as:
+### 2.2 Data Ownership & Hashing
+$$core\_id_{owner} \equiv hash(db\_id, table\_id, col\_id, block\_id) \pmod{num\_cores}$$
 
-$$core\\_id\_{owner} \equiv hash(table\\_num, col\\_num, block\\_num) \mod{num\\_cores}$$
+Hashing each column independently distributes a single row's columns across the mesh. This prevents the single core owning an active block from bottlenecking table writes.
 
-Where
+---
 
-$$\forall n, v \in \mathbb{N}, \ hash(v\_{0}, \ldots, v\_{n}) \ne hash(v\_{0}, \ldots, v\_{n}, 0)$$
+## 3. Data Lifecycle: Transactions, Updates & Deletions
+* **Deletions:** Data is never physically deleted inline. Every table contains an implicit `tombstones` column (boolean). Deleting a row simply flips its tombstone bit to `true`.
+* **Updates:** Updates are strictly implemented as a `DELETE` followed by an `INSERT` at a new `rowid`.
+* **Transactions:** Every table contains a `transaction` column (`uint64`). Every core maintains a local thread-safe ledger of ongoing transactions. When a transaction commits, its ID is removed from the ledger and the commit state is broadcasted to all cores via the mesh.
+* **Implicit Filtering:** Because blocks are raw, compact, and aligned, the engine relies heavily on vectorized SIMD operations to aggressively apply an implicit `WHERE deleted = false AND committed = true` mask to every query before materializing results.
 
-Owners for some files from the above example:
+---
 
-|file|owner $$\mod{num\\_cores}$$|
-|---|---|
-|`.../database/users/table_0/meta.json`|$$core\\_id\_{owner} = hash(0)$$|
-|`.../database/users/table_0/col_0/meta.json`|$$core\\_id\_{owner} = hash(0, 0)$$|
-|`.../database/users/table_0/col_1/wal.log`|$$core\\_id\_{owner} = hash(0, 1)$$|
-|`.../database/users/table_0/col_2/blocks/block_7.dat`|$$core\\_id\_{owner} = hash(0, 2, 7)$$|
+## 4. Inter-Core Mesh & Global State
+* **SPSC Interconnect:** `glommio::channels::mesh` provides the $N \times N$ communication grid. Cores poll these queues asynchronously. Because data is `!Send`, cores cannot pass `Arc<Data>` pointers. Instead, the owner core fulfills read requests by sending dense, copied byte buffers over the mesh to the requesting core.
+* **Global ID Allocation:** A single global `AtomicU64` manages `rowid` assignment. Locking once per batch transaction, rather than per row, minimizes atomic cache-line invalidation.
 
-## Processing data
-On an incoming connection, the core that receives it, handles it from start to finish.
-That implies that any core must be able to read any data.
-This happens by cross-core message passing.
+---
 
-### Cross-core reads
-When `core 0` needs to read a block that belongs to `core 3`, an asynchronous message is sent from `0` to `3`.
-`3` can then use his cache or read the block newly, and then send an async message back to `0`.
-That response message contains an `Arc<Data>` (whatever `Data` is), which `3` owns, but can pass out copies of it.
+## 5. Write Pipeline (Insertions & WAL)
+The coordinator core handles the transaction lifecycle within its local executor.
 
-### Cross-core inserts
-When `core 0` needs to insert into a block that belongs to `core 3`, again, `0` sends a message.
-`3` must update the block however he wants (probably in-mem, maybe `fsync`) and sends back a copy to `0`.
-Additionally, `3` must now send a message to all other cores (or at least the ones that requested that block in the past) with a fresh `Arc<Data>`.
-Other cores that are interested, can (and should) then update their version of the block with the new data.
+1. **Materialize & Allocate:** The coordinator buffers the insert payload, counts rows ($n$), and executes `fetch_add(n)` on the global atomic for a contiguous `rowid` block.
+2. **Direct WAL Append:** The coordinator maps rows to `rowid`s and writes the batch to `wal_<core_id>.log` via `DmaFile` append.
+3. **Mesh Dispatch:** The coordinator hashes the target core for each column fragment and sends batched SPSC messages.
+4. **Local Materialization:** Target cores receive SPSC messages, update their `!Send` in-memory 256KiB buffers, and independently flush to disk. Target cores must then broadcast the updated block data back to any cores currently caching it.
 
-### Deletions
-Deletions don't happen. Instead, every table has a `tombstones` column of type `bool` that tracks deleted rows.
-Every query implicitly contains a `WHERE deleted=false` clause.
+```mermaid
+sequenceDiagram
+    participant Client
+    participant C1 as Coordinator (glommio T1)
+    participant Global as Global AtomicU64
+    participant WAL as Local DmaFile (wal_1.log)
+    participant Target as Worker Cores (glommio mesh)
 
-### Updates
-Updates are implemented as `delete+insert`.
+    Client->>C1: INSERT INTO t1 ...
+    C1->>C1: Materialize Read Query (Count = N)
+    C1->>Global: fetch_add(N)
+    Global-->>C1: Allocated [rowid_start, rowid_end]
+    C1->>WAL: io_uring append (Materialized Rows + RowIDs)
+    C1->>C1: Batch Rows by Target Core Hash
+    C1->>Target: Mesh Channel: Send Column Fragments
+```
 
-## Transactionality
-Similar to deletions, there exists a column `transaction` for every table.
-Every thread keeps a copy of a transaction ledger that holds the state of any ongoing transaction.
-When a transaction commits, its id in the ledger is removed, and a message with that update is broadcasted to all cores.
+---
 
-An ongoing transaction ignores rows which aren't committed yet (implicitly adding a `WHERE committed = true` to every query).
+## 6. Read Pipeline & Routing
+Routing relies on thread-local state.
 
-## Notes
-* my keeping names in the metadata files and not in the directory structure, we can allow stuff to be renamed
-  * during query compilation, names are resolved to numbers, so compiled queries are not affected by renames in any way
-* keeping the data blocks raw/compact and the data aligned, allows us to make heavy use of SIMD for filtering (which we'll need because of the implicit `WHERE deleted = false AND committed = true` in every query)
-* compression is a disk-only thing, not an in-memory
-  * if we held compressed data in memory, we might as well flush it an free the memory
-  * `strtab.dat` should be compressed on disk
-  * blocks can be sparse (especially for bool columns), meaning no `block_<n>.dat` if it only contains 256KiB of the same byte (`sparse_value` can be added in the block metadata)
+1. **Local Pruning:** The coordinator checks its thread-local Zone Map for overlapping `block_id`s, unconditionally including unsealed active blocks.
+2. **Mesh RPC:** Batched read requests traverse the mesh to target workers.
+3. **Zero-Copy Fetch:** Workers fetch blocks via `DmaFile`, apply SIMD masks for `tombstones` and `transaction_committed`, and return dense buffers to the coordinator.
+4. **Tuple Alignment:** The coordinator aligns scattered column fragments by `rowid` and streams tuples to the TCP socket.
 
-## Indices
-* no idea yet
+---
+
+## 7. String Dictionary (strtab) Implementation
+The string table architecture decouples physical chronological storage from logical alphabetical sorting, enabling both block-level compression and $O(\log n)$ lookups.
+
+* **Physical Storage (`strtab_N.blob`):** Strings are append-only. They are buffered into 4KiB blocks, compressed as an entire block (e.g., using Zstd or LZ4), and appended chronologically. 
+* **The Fat Pointer:** The 64-bit integer stored in the 256KiB column blocks is a direct physical coordinate: `[Chunk ID (16 bits) | 4KiB Block ID (24 bits) | Intra-Block Index (24 bits)]`. This guarantees $O(1)$ physical resolution for reading data back.
+* **The Alphabetical Index (`strtab_N.idx`):** A supplementary on-disk B-Tree maps `String -> Fat Pointer`. When loaded into memory, this index retains the string keys alongside physical offsets. This permits binary searches in RAM without triggering decompressions of the `.blob` blocks.
+* **Arbitrary Wildcards (`%r%`):** Leading wildcards invalidate the alphabetical index. Users must explicitly define a secondary Trigram/N-gram index on specific columns to support fast arbitrary substring matching.
+
+### 7.1 Intra-Block Resolution & Length Calculation
+Decompressed 4KiB blocks function as slotted pages. A directory at the end of the block contains an array of `u16` byte offsets mapping the `Intra-Block Index` directly to physical start positions within the buffer.
+
+To guarantee branchless $O(1)$ length calculation, a block containing $N$ strings strictly stores $N + 1$ offsets. This final $N+1$ offset is a synthetic boundary marker that contains no data. It points to the exact end of the data segment (the start of the free space), ensuring the `offset[i+1] - offset[i]` math works universally without requiring an `if (is_last_string)` branch instruction on the CPU hot path.
+
+```mermaid
+flowchart TD
+    Req[Query: WHERE name = 'Arne'] --> Idx[Search Alphabetical B-Tree Index]
+    Idx -- Binary Search (RAM) --> FP[Extract FP: Chunk 0, Block 5, Idx 2]
+    FP --> Dma[io_uring Read: strtab_0.blob, Block 5]
+    Dma --> Decomp[Decompress 4KiB Block]
+    Decomp --> CalcLen[Calculate Length: offset[3] - offset[2]]
+    CalcLen --> Extract[Read N bytes at offset[2]]
+    Extract --> Worker[SIMD Scan using integer FP]
+```
+
+---
+
+## 8. Distributed Sorting & Local Indexing
+
+### 8.1 Distributed Tournament Sort (ORDER BY)
+When a query requests an `ORDER BY`, every worker core first sorts its local column fragments in-memory. The cores then form a reduction tree, streaming their sorted buffers to designated peers via SPSC channels (e.g., Core 1 merges with Core 2). This halves the data hierarchically until a single sorted stream reaches the coordinator.
+
+### 8.2 Strictly Thread-Local Indices
+Every worker core maintains its own isolated `!Send` B-Tree or Hash Index that maps logical values strictly to the physical rows it personally owns. Because no other thread can read or write to this index, it requires zero atomics or mutexes. 
+
+### 8.3 Distributed Index Resolution
+The coordinator broadcasts an index query (e.g., `WHERE age = 30`) across the mesh. Each worker independently traverses its local index in parallel. Cores without matching records instantly drop the request, while cores owning the relevant data resolve the physical pointer and return the materialized tuple to the coordinator.
